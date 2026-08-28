@@ -24,6 +24,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
 
 API = "http://localhost:8080/api/weoinvoice"
@@ -90,6 +91,40 @@ def resolver(artigos, termo):
 
 def euros(v) -> str:
     return f"{float(v):.2f}".replace(".", ",") + " €"
+
+
+def resolver_data(termo: str) -> str:
+    """
+    Converte o que o usuário escreveu para YYYY-MM-DD.
+
+    Resolvido aqui, e não pelo modelo: o LLM nem sempre sabe a data de hoje, e
+    errar o dia num fecho de caixa passa despercebido.
+    """
+    t = (termo or "hoje").strip().lower()
+    hoje = date.today()
+
+    if t in ("", "hoje"):
+        return hoje.isoformat()
+    if t in ("ontem", "ontem."):
+        return (hoje - timedelta(days=1)).isoformat()
+    if t in ("anteontem", "antes de ontem"):
+        return (hoje - timedelta(days=2)).isoformat()
+
+    if re.fullmatch(r"-?\d{1,3}", t):  # "-3" ou "3" = dias atrás
+        return (hoje - timedelta(days=abs(int(t)))).isoformat()
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+        return t
+
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?", t)  # DD/MM[/AAAA]
+    if m:
+        dia, mes, ano = int(m.group(1)), int(m.group(2)), int(m.group(3) or hoje.year)
+        try:
+            return date(ano, mes, dia).isoformat()
+        except ValueError:
+            raise ValueError(f"data inexistente: {termo}")
+
+    raise ValueError(f'não entendi a data "{termo}". Use hoje, ontem, DD/MM ou AAAA-MM-DD.')
 
 
 def carregar_vendas(bruto: str):
@@ -189,7 +224,11 @@ def main():
     chave = ler_chave(CHAVE_API)
 
     if modo == "--dia":
-        data = sys.argv[2] if len(sys.argv) > 2 else "hoje"
+        pedido = sys.argv[2] if len(sys.argv) > 2 else "hoje"
+        try:
+            data = resolver_data(pedido)
+        except ValueError as e:
+            sys.exit(str(e))
         d = http(f"{API}/faturas/dia?data={data}", chave=chave)
         if not d.get("sucesso"):
             sys.exit(f"erro: {d.get('mensagem', d)}")
