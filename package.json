@@ -1,0 +1,16 @@
+{
+  "name": "weoinvoice-api",
+  "version": "0.1.0",
+  "description": "API HTTP para lançar vendas POS no weoInvoice sem browser",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thluiz/weoinvoice-api.git"
+  },
+  "scripts": {
+    "start": "bun run server.ts",
+    "probe": "bun run probe.ts",
+    "test": "bun test"
+  }
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=weoInvoice API (Bun port 8007)
+After=network.target
+
+[Service]
+Type=simple
+User=weoinvoice
+WorkingDirectory=/opt/weoinvoice-api
+ExecStart=/usr/local/bin/bun run /opt/weoinvoice-api/server.ts
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/weoinvoice-api/.env
+Environment=HOME=/opt/weoinvoice-api
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

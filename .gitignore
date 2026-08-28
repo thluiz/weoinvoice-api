@@ -1,0 +1,37 @@
+# ============================================================================
+# Este serviço lida com credenciais e documentos fiscais.
+# Na dúvida sobre um arquivo novo, ignore-o aqui ANTES do primeiro commit:
+# o git guarda para sempre o que entrou uma vez.
+# ============================================================================
+
+# --- credenciais -----------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+api-key
+*.pem
+secrets.json
+
+# --- estado da sessão autenticada (contém o cookie PHPSESSID) --------------
+session.json
+session*.json
+
+# --- dados de faturação (números de documento, totais, clientes) -----------
+ledger.jsonl
+logs/
+*.jsonl
+!*.example.jsonl
+
+# --- despejos de HTML do probe (páginas autenticadas da conta) -------------
+*.html
+probe-dump/
+
+# --- ruído de build/editor -------------------------------------------------
+node_modules/
+bun.lockb
+dist/
+*.log
+.DS_Store
+.idea/
+.vscode/
