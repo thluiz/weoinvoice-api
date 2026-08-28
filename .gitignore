@@ -23,6 +23,10 @@ logs/
 *.jsonl
 !*.example.jsonl
 
+# --- catálogo da conta (nomes de artigos, clientes com NIF) ----------------
+catalogo.json
+!catalogo.example.json
+
 # --- despejos de HTML do probe (páginas autenticadas da conta) -------------
 *.html
 probe-dump/

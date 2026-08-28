@@ -70,6 +70,19 @@ function parseSetCookie(headers: Headers): Jar {
 const cookieHeader = (jar: Jar) =>
   Object.entries(jar).map(([k, v]) => `${k}=${v}`).join("; ")
 
+/**
+ * O site nao declara charset. As paginas HTML vem em windows-1252 e as respostas
+ * AJAX em UTF-8, entao decidir pelo conteudo: se a leitura como UTF-8 produzir
+ * caracteres de substituicao, era latin. Sem isto, "TERRARIO" chega partido e o
+ * match de artigo por nome falha.
+ */
+async function decodeBody(res: Response): Promise<string> {
+  const bytes = new Uint8Array(await res.arrayBuffer())
+  const utf8 = new TextDecoder("utf-8").decode(bytes)
+  if (!utf8.includes("�")) return utf8
+  return new TextDecoder("windows-1252").decode(bytes)
+}
+
 /** Marcador de que o servidor devolveu a pagina de login no lugar do conteudo. */
 function looksLikeLoginPage(text: string) {
   return /name=["']password["']/i.test(text) && /func=submitlogin/i.test(text)
@@ -86,6 +99,12 @@ export interface CartItem {
   itemId: string
   nome?: string
   subtotal?: number
+}
+
+export interface CartSnapshot {
+  itens: CartItem[]
+  /** Total calculado pelo servidor. E a unica fonte confiavel do valor da fatura. */
+  total: number
 }
 
 export interface AddResult {
@@ -221,7 +240,7 @@ export class WeoClient {
       },
       body,
     })
-    const text = await res.text()
+    const text = await decodeBody(res)
     if (looksLikeLoginPage(text)) {
       this.loggedIn = false
       throw new WeoError("SESSAO", `sessao expirou durante ${func}`)
@@ -237,7 +256,7 @@ export class WeoClient {
       headers: { "User-Agent": UA, Cookie: cookieHeader(this.jar) },
       redirect: "manual",
     })
-    const text = await res.text()
+    const text = await decodeBody(res)
     if (res.status >= 300 && res.status < 400) {
       this.loggedIn = false
       throw new WeoError("SESSAO", `redirect ao buscar ${qs} (sessao caiu)`)
@@ -252,18 +271,20 @@ export class WeoClient {
   // --------------------------------------------------------------- carrinho
 
   /**
-   * Le os itens atualmente no carrinho POS.
+   * Le o carrinho POS a partir da pagina servida.
    *
-   * O carrinho vive na sessao PHP do servidor, entao item orfao de uma venda que
-   * falhou entraria silenciosamente na proxima fatura. Ver R2 no plano.
+   * O carrinho e do UTILIZADOR, nao da sessao: sobrevive a reload e a novo login
+   * (confirmado por sonda em 2026-08-28). Um item orfao de uma venda que falhou
+   * entraria na proxima fatura, por isso ler isto antes de cada venda nao e
+   * opcional. Ver R2 no plano.
    *
-   * PROBE: os seletores abaixo foram deduzidos, nao confirmados contra o DOM real.
-   * `probe.mjs` despeja o HTML pra fechar essa questao. Enquanto
-   * WEO_CART_READ_VERIFIED nao estiver setado, o servidor recusa finalizar.
+   * A pagina traz tres coisas independentes — a contagem em `num_products`, os
+   * ids `itemNNN`, e o total calculado PELO SERVIDOR. Divergencia entre elas e
+   * erro, nao detalhe: significa que a pagina mudou.
    */
-  async readCart(): Promise<CartItem[]> {
+  async readCart(): Promise<CartSnapshot> {
     const html = await this.get("module=invoice&func=pos")
-    return parseCartHtml(html)
+    return parseCartSnapshot(html)
   }
 
   async addProduct(productId: string): Promise<AddResult> {
@@ -340,7 +361,10 @@ export class WeoClient {
    */
   async setItem(itemId: string, quantidade: number, preco: number, descontoPct: number): Promise<UpdateResult> {
     const esperado = round2(quantidade * preco * (1 - descontoPct / 100))
-    const ordem: Array<"dot" | "comma"> = this.priceStyle ? [this.priceStyle] : ["dot", "comma"]
+    // Virgula primeiro: em 2026-08-28 confirmou-se que "10.00" e lido como 1000
+    // (o ponto vira separador de milhar). A ordem so afeta o numero de tentativas;
+    // quem decide e a conferencia do subtotal abaixo.
+    const ordem: Array<"dot" | "comma"> = this.priceStyle ? [this.priceStyle] : ["comma", "dot"]
     let ultimo: UpdateResult | null = null
 
     for (const style of ordem) {
@@ -432,48 +456,68 @@ export class WeoClient {
 // Isolados aqui de proposito: sao a parte fragil (R5). Todos falham alto em vez
 // de chutar, e sao os alvos do probe.mjs.
 
-/** PROBE: confirmar contra o DOM real antes de habilitar WEO_CART_READ_VERIFIED. */
+/** Itens do carrinho: a pagina renderiza um `id="itemNNN"` por linha. */
 export function parseCartHtml(html: string): CartItem[] {
-  const encontrados = new Map<string, CartItem>()
+  const ids = [...html.matchAll(/id=["']item(\d+)["']/gi)].map((m) => m[1]!)
+  return [...new Set(ids)].map((itemId) => ({ itemId }))
+}
 
-  // A tabela do carrinho fica entre o marcador de itens e o rodape de totais.
-  const regiao = sliceCartRegion(html)
-  const alvo = regiao ?? ""
+/** Contador que a pagina mantem em `num_products`. */
+export function parseCartCount(html: string): number | null {
+  const v = html.match(/id=["']num_products["'][^>]*value=["'](\d+)["']/i)?.[1]
+  return v === undefined ? null : Number(v)
+}
 
-  const padroes = [
-    /removePosInvoiceProduct\((?:'|")?(\d+)(?:'|")?\)/gi,
-    /id=["']posinvoiceproduct(\d+)["']/gi,
-    /id=["']posproduct(\d+)["']/gi,
-    /data-posinvoiceproduct=["'](\d+)["']/gi,
-  ]
-  for (const re of padroes) {
-    for (const m of alvo.matchAll(re)) {
-      const id = m[1]!
-      if (!encontrados.has(id)) encontrados.set(id, { itemId: id })
-    }
+/** Total do carrinho calculado pelo servidor (rodape do POS). */
+export function parseCartTotal(html: string): number | null {
+  const m = html.match(/pos-invoice-products-total-value[^>]*>\s*<span>([^<]*)<\/span>/i)
+  if (!m) return null
+  const n = parseNum(m[1] ?? "")
+  return isNaN(n) ? null : n
+}
+
+/**
+ * Junta os tres sinais e exige que concordem.
+ *
+ * Se a contagem nao bater com o numero de ids, ou se o total nao for legivel,
+ * e porque a pagina mudou — e ai a leitura do carrinho deixa de ser confiavel,
+ * que e precisamente a condicao em que nao se pode emitir.
+ */
+export function parseCartSnapshot(html: string): CartSnapshot {
+  const itens = parseCartHtml(html)
+  const count = parseCartCount(html)
+  const total = parseCartTotal(html)
+
+  if (count === null) {
+    throw new WeoError("PARSE", "nao encontrei num_products na pagina POS")
   }
-  return [...encontrados.values()]
+  if (total === null) {
+    throw new WeoError("PARSE", "nao consegui ler o total do carrinho na pagina POS")
+  }
+  if (count !== itens.length) {
+    throw new WeoError(
+      "PARSE",
+      `carrinho inconsistente: num_products=${count} mas ${itens.length} ids "itemNNN" no HTML`,
+      { ids: itens.map((i) => i.itemId) },
+    )
+  }
+  return { itens, total }
 }
 
-function sliceCartRegion(html: string): string | null {
-  const inicio = html.search(/id=["'](?:pos_?invoice_?products|posinvoicetable|pos_items)["']/i)
-  if (inicio === -1) return null
-  const resto = html.slice(inicio)
-  const fim = resto.search(/<\/table>/i)
-  return fim === -1 ? resto : resto.slice(0, fim)
-}
-
-/** Resposta de ajax_getclients: registros separados por %% e campos por |. */
+/**
+ * Resposta de ajax_getclients: registos separados por `|`, campos por `%%`.
+ * Campos observados: [id, ?, nome, NIF].
+ */
 export function parseClientsResponse(text: string): Array<{ id: string; nome: string; nif?: string }> {
   const out: Array<{ id: string; nome: string; nif?: string }> = []
-  for (const bruto of text.split("%%")) {
+  for (const bruto of text.split("|")) {
     const reg = bruto.trim()
     if (!reg) continue
-    const campos = reg.split("|").map((c) => c.trim())
-    const id = campos.find((c) => /^\d{4,}$/.test(c))
-    const nome = campos.find((c) => c && !/^\d+$/.test(c))
-    if (!id || !nome) continue
-    const nif = campos.find((c) => /^\d{9}$/.test(c) && c !== id)
+    const campos = reg.split("%%").map((c) => c.trim())
+    const id = campos[0]
+    const nome = campos[2]
+    const nif = campos[3]
+    if (!id || !/^\d+$/.test(id) || !nome) continue
     out.push({ id, nome, ...(nif ? { nif } : {}) })
   }
   return out
@@ -496,14 +540,21 @@ export function parsePosProductsHtml(html: string): Array<{ id: string; nome: st
   return [...out.values()]
 }
 
-/** PROBE: a serie corrente e a option selecionada no combobox pos_serie. */
+/**
+ * Serie corrente.
+ *
+ * O `<select id="pos_serie">` vem vazio no HTML — o JS copia para dentro dele o
+ * conteudo de `#pos-serie-standard`, e o `ajax_getseries` esta comentado no
+ * pos.js. Logo, a fonte e o bloco escondido, cuja primeira option e o ano
+ * corrente. Devolve null (erro alto) se nao achar: nunca assumir o ano.
+ */
 export function parseSerieHtml(html: string): string | null {
-  const sel = html.match(/<select[^>]*name=["']pos_serie["'][\s\S]*?<\/select>/i)?.[0]
-  if (!sel) return null
-  const selecionada = sel.match(/<option[^>]*selected[^>]*value=["']([^"']+)["']/i)?.[1]
-    ?? sel.match(/<option[^>]*value=["']([^"']+)["'][^>]*selected/i)?.[1]
+  const bloco = html.match(/id=["']pos-serie-standard["'][^>]*>([\s\S]{0,2000}?)<\/(?:div|select|span)>/i)?.[1]
+  if (!bloco) return null
+  const selecionada = bloco.match(/<option[^>]*selected[^>]*value=["']([^"']+)["']/i)?.[1]
+    ?? bloco.match(/<option[^>]*value=["']([^"']+)["'][^>]*selected/i)?.[1]
   if (selecionada) return selecionada.trim()
-  const primeira = sel.match(/<option[^>]*value=["']([^"']+)["']/i)?.[1]
+  const primeira = bloco.match(/<option[^>]*value=["']([^"']+)["']/i)?.[1]
   return primeira ? primeira.trim() : null
 }
 

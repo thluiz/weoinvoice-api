@@ -11,6 +11,8 @@
 import { appendFile, mkdir } from "node:fs/promises"
 import { WeoClient, WeoError, round2, sameMoney, CENT } from "./weo"
 import { Ledger } from "./ledger"
+import { CatalogoStore, resolverPorNome } from "./catalogo"
+import { tratarMcp, novaIdempotencyKey } from "./mcp"
 
 const PORT = Number(process.env.PORT ?? 8007)
 const API_KEY = process.env.WEOINVOICE_API_KEY ?? ""
@@ -79,9 +81,8 @@ async function notificar(mensagem: string) {
 const client = new WeoClient({ email: EMAIL, password: PASSWORD, sessionPath: SESSION_PATH, log })
 const ledger = new Ledger(LEDGER_PATH)
 
-/** Catalogo com cache curto — evita hardcode de ids de artigo/cliente. */
-const CATALOGO_TTL_MS = 60 * 60 * 1000
-let catalogoCache: { at: number; artigos: any[]; clientes: any[] } | null = null
+/** Catalogo em ficheiro: nao muda quase nunca e evita login so para consultar. */
+const catalogo = new CatalogoStore(`${DIR}/catalogo.json`)
 
 /** Fila: o carrinho e estado da sessao PHP, entao duas vendas em paralelo se misturariam. */
 let fila: Promise<unknown> = Promise.resolve()
@@ -110,33 +111,22 @@ function autorizado(req: Request) {
   return req.headers.get("x-api-key") === API_KEY
 }
 
-async function carregarCatalogo(forcar = false) {
-  if (!forcar && catalogoCache && Date.now() - catalogoCache.at < CATALOGO_TTL_MS) return catalogoCache
-  await client.ensureSession()
-  const [artigos, clientes] = await Promise.all([client.getPosProducts(), client.getClients()])
-  catalogoCache = { at: Date.now(), artigos, clientes }
-  return catalogoCache
-}
-
-/** Resolve nome de artigo para id. Match exato (case-insensitive); nunca fuzzy silencioso. */
+/** Resolve nome de artigo para id, a partir do catalogo em ficheiro. */
 async function resolverArtigo(item: { artigoId?: string; artigo?: string }): Promise<string> {
   if (item.artigoId) return String(item.artigoId).replace(/^product/i, "")
   if (!item.artigo) throw new ApiError("ARTIGO_DESCONHECIDO", "informe artigoId ou artigo")
 
-  const { artigos } = await carregarCatalogo()
-  const alvo = item.artigo.trim().toLowerCase()
-  const exatos = artigos.filter((a) => a.nome.toLowerCase() === alvo)
-  if (exatos.length === 1) return exatos[0].id
-  if (exatos.length > 1) {
-    throw new ApiError("ARTIGO_DESCONHECIDO", `"${item.artigo}" e ambiguo`, 400, exatos.map((a) => a.nome))
-  }
-  const parciais = artigos.filter((a) => a.nome.toLowerCase().startsWith(alvo))
-  if (parciais.length === 1) return parciais[0].id
+  const { artigos } = await catalogo.obter(client)
+  const { id, candidatos } = resolverPorNome(artigos, item.artigo)
+  if (id) return id
+
   throw new ApiError(
     "ARTIGO_DESCONHECIDO",
-    `artigo "${item.artigo}" nao encontrado no catalogo POS`,
-    404,
-    parciais.length ? parciais.map((a) => a.nome) : undefined,
+    candidatos?.length
+      ? `"${item.artigo}" e ambiguo no catalogo`
+      : `artigo "${item.artigo}" nao esta no catalogo (POST /catalogo/refresh se foi criado agora)`,
+    candidatos?.length ? 400 : 404,
+    candidatos?.length ? candidatos : artigos.map((a) => a.nome),
   )
 }
 
@@ -232,14 +222,21 @@ async function executarVenda(req: SaleReq) {
 
   await client.ensureSession()
 
-  // 2. carrinho limpo antes de comecar (R2: item orfao entraria nesta fatura)
-  const restos = await client.readCart()
-  if (restos.length) {
-    log("carrinho tinha itens de uma venda anterior, limpando", { itens: restos.map((r) => r.itemId) })
-    await audit("carrinho_sujo", { itens: restos })
-    const { falhas } = await client.removeItems(restos.map((r) => r.itemId))
+  // 2. carrinho limpo antes de comecar.
+  // O carrinho e do utilizador, nao da sessao: sobrevive a reload e a novo login.
+  // Um item deixado por uma venda anterior (ou pela UI do browser) entraria nesta
+  // fatura sem aviso.
+  const antes = await client.readCart()
+  if (antes.itens.length) {
+    log("carrinho tinha itens de antes, limpando", { itens: antes.itens.map((r) => r.itemId), total: antes.total })
+    await audit("carrinho_sujo", { itens: antes.itens, total: antes.total })
+    const { falhas } = await client.removeItems(antes.itens.map((r) => r.itemId))
     if (falhas.length) {
       throw new ApiError("CARRINHO_SUJO", `nao consegui limpar o carrinho (itens ${falhas.join(", ")})`, 409)
+    }
+    const conferido = await client.readCart()
+    if (conferido.itens.length) {
+      throw new ApiError("CARRINHO_SUJO", `carrinho ainda tem ${conferido.itens.length} itens apos a limpeza`, 409)
     }
   }
 
@@ -272,12 +269,12 @@ async function executarVenda(req: SaleReq) {
 
     // 4. o carrinho tem exatamente o que colocamos, nem a mais nem a menos
     const conferencia = await client.readCart()
-    if (conferencia.length !== adicionados.length) {
+    if (conferencia.itens.length !== adicionados.length) {
       throw new ApiError(
         "TOTAL_DIVERGENTE",
-        `carrinho tem ${conferencia.length} itens mas foram adicionados ${adicionados.length}`,
+        `carrinho tem ${conferencia.itens.length} itens mas foram adicionados ${adicionados.length}`,
         409,
-        { noCarrinho: conferencia.map((c) => c.itemId), adicionados },
+        { noCarrinho: conferencia.itens.map((c) => c.itemId), adicionados },
       )
     }
 
@@ -287,9 +284,23 @@ async function executarVenda(req: SaleReq) {
         0,
       ),
     )
-    // cada linha pode divergir um cetimo por arredondamento; o total, N cetimos
-    if (!sameMoney(total, esperado, CENT * req.itens.length)) {
-      throw new ApiError("TOTAL_DIVERGENTE", `total ${total} difere do esperado ${esperado}`, 409)
+    const tolerancia = CENT * req.itens.length // um cetimo de arredondamento por linha
+
+    // A soma das linhas bate com o pedido?
+    if (!sameMoney(total, esperado, tolerancia)) {
+      throw new ApiError("TOTAL_DIVERGENTE", `soma das linhas ${total} difere do pedido ${esperado}`, 409)
+    }
+
+    // E o total que o SERVIDOR calcula para o carrinho? Esta e a verificacao que
+    // vale: e o valor que vai para o documento fiscal, e apanha tudo o que as
+    // outras nao apanham (item orfao, preco mal interpretado, linha duplicada).
+    if (!sameMoney(conferencia.total, esperado, tolerancia)) {
+      throw new ApiError(
+        "TOTAL_DIVERGENTE",
+        `o carrinho no servidor totaliza ${conferencia.total.toFixed(2)} mas o pedido e ${esperado.toFixed(2)}`,
+        409,
+        { totalServidor: conferencia.total, esperado, linhas },
+      )
     }
 
     // 5. dry-run para por aqui: desmonta o carrinho e devolve o preview
@@ -300,12 +311,13 @@ async function executarVenda(req: SaleReq) {
         sucesso: true,
         dryRun: true,
         total,
+        totalNoServidor: conferencia.total,
         itens: linhas,
         clienteId,
         tipoDocumento: req.tipoDocumento,
         serie: req.serie ?? (await client.getSerie()),
         formatoDecimal: client.priceFormat,
-        carrinhoLimpoDepois: sobra.length === 0,
+        carrinhoLimpoDepois: sobra.itens.length === 0,
       }
     }
   } catch (e) {
@@ -417,6 +429,7 @@ const server = Bun.serve({
 
     if (rota === "/health") {
       const temSessao = await client.loadSession()
+      const cat = await catalogo.carregar().catch(() => null)
       return json({
         ok: true,
         servico: "weoinvoice-api",
@@ -425,6 +438,9 @@ const server = Bun.serve({
         carrinhoVerificado: CART_VERIFIED,
         emissaoRealHabilitada: CART_VERIFIED,
         formatoDecimal: client.priceFormat,
+        catalogo: cat
+          ? { atualizadoEm: cat.atualizadoEm, artigos: cat.artigos.length, clientes: cat.clientes.length }
+          : null,
       })
     }
 
@@ -433,16 +449,55 @@ const server = Bun.serve({
     }
 
     try {
+      // Le do ficheiro: nao faz login, nao derruba a sessao do browser.
       if (rota === "/catalogo" && req.method === "GET") {
-        const forcar = url.searchParams.get("refresh") === "1"
-        const c = await carregarCatalogo(forcar)
-        return json({ sucesso: true, atualizadoEm: new Date(c.at).toISOString(), artigos: c.artigos, clientes: c.clientes })
+        const c = await catalogo.obter(client)
+        return json({ sucesso: true, ...c })
+      }
+
+      // Vai ao weoInvoice e reescreve o ficheiro. Diz o que mudou.
+      if (rota === "/catalogo/refresh" && req.method === "POST") {
+        const { catalogo: c, mudancas } = await catalogo.atualizar(client)
+        log("catalogo actualizado", { ...mudancas, artigos: c.artigos.length, clientes: c.clientes.length })
+        await audit("catalogo_refresh", { ...mudancas })
+        if (mudancas.artigosNovos.length || mudancas.artigosRemovidos.length) {
+          await notificar(
+            `📦 weoInvoice catálogo: ${mudancas.artigosNovos.length} artigo(s) novo(s), ` +
+              `${mudancas.artigosRemovidos.length} removido(s)`,
+          )
+        }
+        return json({ sucesso: true, mudancas, atualizadoEm: c.atualizadoEm, artigos: c.artigos, clientes: c.clientes })
       }
 
       if (rota === "/faturas" && req.method === "GET") {
         const n = Math.min(Number(url.searchParams.get("ultimas") ?? 10) || 10, 50)
         await client.ensureSession()
         return json({ sucesso: true, faturas: await client.listInvoices(n) })
+      }
+
+      // MCP sobre HTTP, mesmo padrao do gossip-gate. Reusa as funcoes da REST.
+      if (rota === "/mcp" && req.method === "POST") {
+        const msg = await req.json().catch(() => null)
+        const resposta = await tratarMcp(msg, {
+          lancarNota: async (args) => {
+            const pedido = validarRequest({
+              ...args,
+              ...(args?.dryRun ? {} : { idempotencyKey: args?.idempotencyKey ?? novaIdempotencyKey() }),
+            })
+            return enfileirar(() => executarVenda(pedido))
+          },
+          catalogo: () => catalogo.obter(client),
+          atualizarCatalogo: async () => {
+            const { catalogo: c, mudancas } = await catalogo.atualizar(client)
+            await audit("catalogo_refresh", { ...mudancas, origem: "mcp" })
+            return { mudancas, atualizadoEm: c.atualizadoEm, artigos: c.artigos, clientes: c.clientes }
+          },
+          ultimasFaturas: async (n) => {
+            await client.ensureSession()
+            return { faturas: await client.listInvoices(Math.min(n || 10, 50)) }
+          },
+        })
+        return resposta === null ? new Response(null, { status: 202 }) : json(resposta)
       }
 
       if (rota === "/pos/sale" && req.method === "POST") {

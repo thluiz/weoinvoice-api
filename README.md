@@ -32,24 +32,31 @@ e envolve cada passo nas proteções abaixo.
 | **Item órfão.** Uma venda que falhou no meio deixa item no carrinho, que entraria silenciosamente na fatura seguinte. | O carrinho é lido e esvaziado antes de cada venda, conferido item a item depois de montado, e desmontado por rollback em qualquer erro. |
 | **Valor errado no documento.** | O subtotal que o site calcula é comparado com o esperado, linha a linha e no total. Divergência aborta antes de emitir. |
 | **Duas vendas ao mesmo tempo** misturariam itens no mesmo carrinho. | Fila interna: uma venda por vez, do início ao fim. |
-| **Separador decimal.** Não está documentado se o site quer `15.50` ou `15,50`. | Descoberto em runtime: manda com ponto, confere o subtotal devolvido; se não bater, tenta vírgula; se ainda não bater, aborta. O formato que funcionou fica memorizado. |
+| **Separador decimal.** | Negociado em runtime: manda um formato, confere o subtotal devolvido, tenta o outro se não bater, aborta se nenhum bater. Não é paranoia — ver o aviso abaixo. |
 | **A interface mudar sem aviso.** É uma API não documentada. | Os parsers falham alto em vez de chutar, e a falha vira notificação. |
+
+### ⚠️ O separador decimal não é detalhe
+
+Enviar `price=10.00` faz o site interpretar **1000**: ele lê o ponto como separador de
+milhar. Uma venda de dez euros emitiria uma fatura de mil. O formato correto é vírgula
+(`10,00`), mas o serviço não confia nisso — ele envia, lê o subtotal que o site devolve, e
+só prossegue se bater com o esperado. É a mesma verificação que apanha item órfão e preço
+ignorado, e está coberta por teste de regressão.
 
 ### A trava `WEO_CART_READ_VERIFIED`
 
-Ler o carrinho é o que impede um item órfão de entrar na fatura, e o parser que faz isso
-depende de HTML que varia entre contas. Enquanto `WEO_CART_READ_VERIFIED=1` não estiver
-no `.env`:
+Ler o carrinho é o que impede um item órfão de entrar na fatura, e o HTML pode variar
+entre contas. Enquanto `WEO_CART_READ_VERIFIED=1` não estiver no `.env`, `dryRun` funciona
+mas a emissão real é recusada com `HTTP 503`.
 
-- `dryRun: true` funciona normalmente;
-- emissão real é recusada com `HTTP 503 CARRINHO_NAO_VERIFICADO`.
-
-Para destravar, rode o probe, confira a estrutura do carrinho no HTML despejado, ajuste
-`parseCartHtml` em `weo.ts` se necessário, e só então mude a flag:
+Antes de destravar, confirme os parsers contra a sua conta:
 
 ```bash
 bun run probe.ts --dump   # read-only: não adiciona nem emite nada
 ```
+
+Confira que os artigos aparecem, que a série sai correta, e que o carrinho é lido com um
+item presente (adicione um pela interface web e volte a correr). Só então mude a flag.
 
 ## Instalação
 
@@ -78,8 +85,21 @@ Todos exigem o header `X-Api-Key`, exceto `/health`.
 ### `GET /health`
 Estado do serviço, se há sessão em cache e se a emissão real está habilitada. Não faz login.
 
-### `GET /catalogo[?refresh=1]`
-Artigos POS e clientes da conta, com cache de 1h. É o que resolve `"artigo": "NOME"` → id.
+### `GET /catalogo`
+Artigos POS e clientes da conta, lidos de `catalogo.json`. É o que resolve
+`"artigo": "NOME"` → id. Não faz login, portanto não derruba a sessão do browser.
+
+### `POST /catalogo/refresh`
+Vai ao weoInvoice, reescreve `catalogo.json` e devolve o que mudou:
+
+```json
+{ "sucesso": true, "mudancas": { "artigosNovos": ["..."], "artigosRemovidos": [],
+  "clientesNovos": 2, "clientesRemovidos": 0 } }
+```
+
+O catálogo fica em ficheiro em vez de ser buscado a cada pedido porque muda muito
+raramente e cada busca custa um login. Chame isto quando criar artigo ou cliente novo.
+Se o weoInvoice devolver zero artigos, o ficheiro **não** é sobrescrito.
 
 ### `GET /faturas?ultimas=N`
 Últimos N documentos da listagem.
@@ -158,6 +178,22 @@ onde o serviço o lê depois de emitir.
 
 Os tipos de documento habilitados variam por conta: `Factura` e `Factura Simplificada`
 são os que este serviço cobre.
+
+Outras coisas que só se descobrem por inspeção:
+
+- **O carrinho pertence ao utilizador, não à sessão.** Sobrevive a reload e a novo login.
+  Um item deixado para trás fica lá à espera da próxima fatura, e a interface web não o
+  mostra ao recarregar — ela reconstrói o carrinho só a partir do que você clica.
+  Por isso o serviço lê e esvazia o carrinho antes de cada venda.
+- **A página POS reflete o carrinho do servidor** em `num_products`, nos ids `itemNNN` e
+  no rodapé de total. Esse total é calculado pelo servidor e é o valor que vai para o
+  documento, por isso é ele que o serviço confere antes de finalizar.
+- **A série não vem de um endpoint.** O `<select id="pos_serie">` chega vazio e o
+  `ajax_getseries` está comentado no `pos.js`; as opções vêm de um bloco escondido
+  `#pos-serie-standard`.
+- **Encoding misto.** As páginas HTML vêm em windows-1252 sem declarar charset, as
+  respostas AJAX em UTF-8. O serviço decide pelo conteúdo, senão nomes acentuados chegam
+  partidos e o match por nome falha.
 
 ## Aviso
 

@@ -4,7 +4,7 @@
  */
 
 import { expect, test, describe } from "bun:test"
-import { parseNum, sameMoney, round2, CENT, parseClientsResponse, parseCartHtml, parseSerieHtml, parseInvoiceListHtml } from "./weo"
+import { parseNum, sameMoney, round2, CENT, parseClientsResponse, parseCartSnapshot, parseSerieHtml, parseInvoiceListHtml } from "./weo"
 
 describe("parseNum", () => {
   test("formato US", () => {
@@ -59,58 +59,90 @@ describe("comparacao monetaria", () => {
 })
 
 describe("parseClientsResponse", () => {
+  // formato real: registos separados por "|", campos por "%%", como [id, ?, nome, NIF]
   test("extrai id, nome e NIF", () => {
-    const r = parseClientsResponse("1000001|CLIENTE BALCAO|999999990%%1000002|Maria Silva|123456789")
+    const r = parseClientsResponse("1000001%%%%CLIENTE BALCAO%%999999990|1000002%%%%Maria Silva%%123456789")
     expect(r).toHaveLength(2)
     expect(r[0]!.id).toBe("1000001")
     expect(r[0]!.nome).toBe("CLIENTE BALCAO")
     expect(r[1]!.nome).toBe("Maria Silva")
     expect(r[1]!.nif).toBe("123456789")
   })
-  test("ignora registros vazios", () => {
-    expect(parseClientsResponse("%%%%")).toHaveLength(0)
+  test("aceita cliente sem NIF", () => {
+    const r = parseClientsResponse("1000003%%%%Cerarte%%")
+    expect(r).toHaveLength(1)
+    expect(r[0]!.nif).toBeUndefined()
+  })
+  test("ignora registos vazios", () => {
+    expect(parseClientsResponse("||")).toHaveLength(0)
   })
 })
 
-describe("parseCartHtml", () => {
-  test("carrinho vazio nao inventa item", () => {
-    expect(parseCartHtml("<html><body><p>sem nada</p></body></html>")).toHaveLength(0)
+describe("parseCartSnapshot", () => {
+  const pagina = (num: number, itens: string[], total: string) => `
+    <div class="pos-invoice-products-list">
+      ${itens.map((i) => `<div class="pos-invoice-products-item" id="item${i}"></div>`).join("")}
+    </div>
+    <input type="hidden" id="num_products" value="${num}" />
+    <div class="pos-invoice-products-total-value"><span>${total}</span></div>`
+
+  test("carrinho vazio", () => {
+    const s = parseCartSnapshot(pagina(0, [], "0,00"))
+    expect(s.itens).toHaveLength(0)
+    expect(s.total).toBe(0)
   })
-  test("acha itens pelo handler de remocao", () => {
-    const html = `<table id="posinvoicetable">
-      <tr><td>ARTIGO A</td><td><a onclick="removePosInvoiceProduct(881)">x</a></td></tr>
-      <tr><td>ARTIGO B</td><td><a onclick="removePosInvoiceProduct(882)">x</a></td></tr>
-    </table>`
-    expect(parseCartHtml(html).map((c) => c.itemId)).toEqual(["881", "882"])
+  test("le itens e o total do servidor em formato PT", () => {
+    const s = parseCartSnapshot(pagina(2, ["10992169", "10992170"], "1.234,56"))
+    expect(s.itens.map((i) => i.itemId)).toEqual(["10992169", "10992170"])
+    expect(s.total).toBe(1234.56)
+  })
+  test("aborta se a contagem nao bater com os ids (pagina mudou)", () => {
+    expect(() => parseCartSnapshot(pagina(3, ["881"], "10,00"))).toThrow(/inconsistente/)
+  })
+  test("aborta se nao achar o total", () => {
+    const html = `<input id="num_products" value="0" />`
+    expect(() => parseCartSnapshot(html)).toThrow(/total/)
+  })
+  test("aborta se nao achar num_products", () => {
+    const html = `<div class="pos-invoice-products-total-value"><span>0,00</span></div>`
+    expect(() => parseCartSnapshot(html)).toThrow(/num_products/)
   })
   test("nao confunde artigo do catalogo com item do carrinho", () => {
-    // os artigos ficam FORA da regiao do carrinho e nao podem ser contados
-    const html = `<div id="product12345">ARTIGO NO CATALOGO</div>
-      <table id="posinvoicetable"><tr><td><a onclick="removePosInvoiceProduct(881)">x</a></td></tr></table>`
-    expect(parseCartHtml(html).map((c) => c.itemId)).toEqual(["881"])
-  })
-  test("nao duplica item citado duas vezes", () => {
-    const html = `<table id="posinvoicetable">
-      <tr id="posinvoiceproduct881"><td><a onclick="removePosInvoiceProduct(881)">x</a></td></tr>
-    </table>`
-    expect(parseCartHtml(html)).toHaveLength(1)
+    const html = `<div id="product63855">ARTIGO</div>` + pagina(1, ["881"], "10,00")
+    expect(parseCartSnapshot(html).itens.map((i) => i.itemId)).toEqual(["881"])
   })
 })
 
 describe("parseSerieHtml", () => {
+  // o <select id="pos_serie"> vem VAZIO; a fonte e o bloco #pos-serie-standard
+  const bloco = (opts: string) => `<select id="pos_serie"></select>
+    <div id="pos-serie-standard">${opts}</div>`
+
+  test("usa a primeira option do bloco escondido", () => {
+    const html = bloco(`<option value="2026">2026</option><option value="2025">2025</option>`)
+    expect(parseSerieHtml(html)).toBe("2026")
+  })
   test("prefere a option marcada como selected", () => {
-    const html = `<select name="pos_serie">
-      <option value="2025">2025</option>
-      <option value="2026" selected>2026</option>
-    </select>`
-    expect(parseSerieHtml(html)).toBe("2026")
+    const html = bloco(`<option value="2026">2026</option><option value="2025" selected>2025</option>`)
+    expect(parseSerieHtml(html)).toBe("2025")
   })
-  test("cai para a primeira option quando nada esta selected", () => {
-    const html = `<select name="pos_serie"><option value="2026">2026</option></select>`
-    expect(parseSerieHtml(html)).toBe("2026")
+  test("devolve null quando o bloco nao existe (nunca chuta o ano)", () => {
+    expect(parseSerieHtml(`<select id="pos_serie"></select>`)).toBeNull()
   })
-  test("devolve null quando o combobox nao existe (nunca chuta o ano)", () => {
-    expect(parseSerieHtml("<html></html>")).toBeNull()
+})
+
+describe("regressao: o bug que emitiria fatura de 1000 euros", () => {
+  // Em 2026-08-28 confirmou-se que enviar price=10.00 faz o site ler 1000: ele
+  // trata o ponto como separador de milhar. A resposta veio "1,00|1.000,00|1000".
+  test("o subtotal devolvido pelo site denuncia o formato errado", () => {
+    const subtotalComPonto = parseNum("1000")
+    const subtotalComVirgula = parseNum("10")
+    expect(sameMoney(subtotalComPonto, 10)).toBe(false) // aborta, como deve
+    expect(sameMoney(subtotalComVirgula, 10)).toBe(true) // aceita
+  })
+  test("o preco devolvido em formato PT le-se correctamente", () => {
+    expect(parseNum("1.000,00")).toBe(1000)
+    expect(parseNum("10,00")).toBe(10)
   })
 })
 

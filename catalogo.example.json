@@ -1,0 +1,11 @@
+{
+  "atualizadoEm": "2026-01-01T00:00:00.000Z",
+  "artigos": [
+    { "id": "10001", "nome": "ARTIGO EXEMPLO" },
+    { "id": "10002", "nome": "OUTRO ARTIGO" }
+  ],
+  "clientes": [
+    { "id": "20001", "nome": "CLIENTE BALCAO", "nif": "999999990" },
+    { "id": "20002", "nome": "Empresa Exemplo Lda", "nif": "500000000" }
+  ]
+}
