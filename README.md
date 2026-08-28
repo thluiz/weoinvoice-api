@@ -102,7 +102,23 @@ raramente e cada busca custa um login. Chame isto quando criar artigo ou cliente
 Se o weoInvoice devolver zero artigos, o ficheiro **não** é sobrescrito.
 
 ### `GET /faturas?ultimas=N`
-Últimos N documentos da listagem.
+Últimos N documentos da listagem, com tipo, cliente, valor, data, estado e se está pago.
+
+### `GET /faturas/dia?data=YYYY-MM-DD`
+Fecho do dia: tudo o que foi emitido nessa data, com o total e a divisão por tipo.
+`data` aceita `hoje` (padrão), resolvido no fuso da máquina.
+
+```json
+{ "sucesso": true, "data": "2026-08-28", "quantidade": 10, "total": 181,
+  "porTipo": { "Factura Simplificada": { "quantidade": 10, "total": 181 } },
+  "faturas": [ { "numero": "2026/17", "cliente": "...", "total": 30 } ] }
+```
+
+A listagem do weoInvoice não filtra por data (só por cliente, tipo e palavra-chave), mas
+vem ordenada da mais recente para a mais antiga. O serviço percorre as páginas e para
+assim que aparece uma data anterior à procurada, o que normalmente resolve na primeira.
+Se uma página não trouxer documento novo, para também: o paginador do site não é de
+confiar e um ciclo aqui seria silencioso.
 
 ### `POST /pos/sale`
 

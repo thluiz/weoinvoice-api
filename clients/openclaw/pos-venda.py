@@ -7,6 +7,7 @@ Por isso o modo normal é --preview, e emitir exige --emitir explicitamente.
 
 Uso:
     pos-venda.py --catalogo
+    pos-venda.py --dia [YYYY-MM-DD]      # fecho do dia (padrão: hoje)
     pos-venda.py --preview '{"vendas":[{"artigo":"cerâmicas","preco":15}]}'
     pos-venda.py --emitir  '{"vendas":[{"artigo":"canecas","preco":15},
                                           {"artigo":"canecas","preco":30}]}'
@@ -186,6 +187,19 @@ def main():
 
     modo = sys.argv[1]
     chave = ler_chave(CHAVE_API)
+
+    if modo == "--dia":
+        data = sys.argv[2] if len(sys.argv) > 2 else "hoje"
+        d = http(f"{API}/faturas/dia?data={data}", chave=chave)
+        if not d.get("sucesso"):
+            sys.exit(f"erro: {d.get('mensagem', d)}")
+        print(f"Documentos de {d['data']}: {d['quantidade']}")
+        for f in d.get("faturas", []):
+            print(f"  {f['numero']:<9} {euros(f.get('total', 0)):>10}  {f.get('cliente', '')}")
+        for tipo, v in (d.get("porTipo") or {}).items():
+            print(f"  · {tipo}: {v['quantidade']}× = {euros(v['total'])}")
+        print(f"\nTotal do dia: {euros(d['total'])}")
+        return
 
     cat = http(f"{API}/catalogo", chave=chave)
     if not cat.get("sucesso"):

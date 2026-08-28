@@ -59,6 +59,18 @@ python3 /opt/weoinvoice/bin/pos-venda.py --emitir '{"vendas":[...]}'
 O script envia o resumo por Telegram sozinho. Mesmo assim, responda ao usuário com os
 números emitidos.
 
+## Fecho do dia
+
+Quando o usuário perguntar quanto vendeu, o que saiu hoje, ou pedir o fecho:
+
+```bash
+python3 /opt/weoinvoice/bin/pos-venda.py --dia            # hoje
+python3 /opt/weoinvoice/bin/pos-venda.py --dia 2026-08-27 # outro dia
+```
+
+Devolve os documentos daquela data com número, valor e cliente, mais o total do dia
+dividido por tipo de documento. É consulta, não emite nada, e não precisa de confirmação.
+
 ## Descobrir os artigos
 
 ```bash

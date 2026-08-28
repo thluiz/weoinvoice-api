@@ -442,9 +442,49 @@ export class WeoClient {
     return serie
   }
 
-  async listInvoices(limite = 10): Promise<Array<{ numero: string; total?: number; cliente?: string; data?: string }>> {
+  async listInvoices(limite = 10): Promise<FaturaLinha[]> {
     const html = await this.get("module=invoice&func=list")
     return parseInvoiceListHtml(html).slice(0, limite)
+  }
+
+  /**
+   * Documentos emitidos numa data (YYYY-MM-DD).
+   *
+   * A listagem nao aceita filtro por data no servidor (so por cliente, tipo e
+   * palavra-chave), mas vem ordenada da mais recente para a mais antiga. Entao
+   * percorre-se as paginas e para-se assim que aparece uma data anterior a
+   * procurada, o que normalmente resolve na primeira pagina.
+   *
+   * O paginador do site nao e de confiar: se uma pagina nao trouxer documento
+   * novo, para-se, para nao entrar em ciclo.
+   */
+  async listInvoicesByDate(data: string, maxPaginas = 10): Promise<FaturaLinha[]> {
+    const achadas: FaturaLinha[] = []
+    const vistos = new Set<string>()
+
+    for (let pagina = 1; pagina <= maxPaginas; pagina++) {
+      const qs =
+        `module=invoice&func=list&page=${pagina}` +
+        `&order=desc&invoicetype=0&clientid=0&keyword=`
+      const linhas = parseInvoiceListHtml(await this.get(qs))
+
+      let novas = 0
+      let passouDoDia = false
+
+      for (const l of linhas) {
+        if (vistos.has(l.numero)) continue
+        vistos.add(l.numero)
+        novas++
+        if (!l.data) continue
+        if (l.data === data) achadas.push(l)
+        else if (l.data < data) passouDoDia = true
+      }
+
+      if (novas === 0) break // paginador nao avancou
+      if (passouDoDia) break // ja passamos para dias anteriores
+    }
+
+    return achadas
   }
 
   invoicePdfUrl(idInterno: string) {
@@ -558,26 +598,80 @@ export function parseSerieHtml(html: string): string | null {
   return primeira ? primeira.trim() : null
 }
 
-/** PROBE: linhas da listagem de documentos. Usado pela reconciliacao (R1). */
-export function parseInvoiceListHtml(html: string): Array<{ numero: string; total?: number; cliente?: string; data?: string }> {
-  const out: Array<{ numero: string; total?: number; cliente?: string; data?: string }> = []
+export interface FaturaLinha {
+  numero: string
+  tipo?: string
+  cliente?: string
+  total?: number
+  data?: string
+  estado?: string
+  pago?: string
+}
+
+const semAcento = (s: string) =>
+  s.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().trim()
+
+function celulasDe(tr: string): string[] {
+  return [...tr.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((m) =>
+    (m[1] ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim(),
+  )
+}
+
+/**
+ * Posicao de cada coluna, lida do cabecalho da tabela.
+ *
+ * Ancorar no cabecalho em vez de adivinhar por formato: antes, "Factura
+ * Simplificada" era apanhado como nome do cliente porque era a primeira celula
+ * de texto da linha.
+ */
+function mapearColunas(celulas: string[]): Record<string, number> | null {
+  const idx: Record<string, number> = {}
+  celulas.forEach((c, i) => {
+    const n = semAcento(c)
+    if (n === "tipo") idx.tipo = i
+    else if (n === "numero") idx.numero = i
+    else if (n === "cliente") idx.cliente = i
+    else if (n === "valor") idx.total = i
+    else if (n === "emissao") idx.data = i
+    else if (n === "estado") idx.estado = i
+    else if (n === "pago") idx.pago = i
+  })
+  return idx.numero !== undefined && idx.data !== undefined ? idx : null
+}
+
+/** Linhas da listagem de documentos. Usado pela reconciliacao (R1) e pelo fecho do dia. */
+export function parseInvoiceListHtml(html: string): FaturaLinha[] {
   const linhas = html.match(/<tr[\s\S]*?<\/tr>/gi) ?? []
+  let col: Record<string, number> | null = null
+  const out: FaturaLinha[] = []
+
   for (const tr of linhas) {
-    const celulas = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) =>
-      (m[1] ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim(),
-    )
+    const celulas = celulasDe(tr)
     if (!celulas.length) continue
-    const numero = celulas.find((c) => /^\d{4}\/\d+$/.test(c))
-    if (!numero) continue
-    const data = celulas.find((c) => /^\d{2,4}[-/]\d{2}[-/]\d{2,4}$/.test(c))
-    const valores = celulas.filter((c) => /\d/.test(c) && /[.,]\d{2}\b/.test(c)).map(parseNum).filter((n) => !isNaN(n))
-    const cliente = celulas.find((c) => c.length > 3 && !/\d{2}[-/:]/.test(c) && !/^\d/.test(c))
+
+    if (!col) {
+      col = mapearColunas(celulas)
+      if (col) continue // era a linha de cabecalho
+    }
+    if (!col) continue
+
+    const numero = celulas[col.numero!]
+    if (!numero || !/^\d{4}\/\d+$/.test(numero)) continue
+
+    const valor = col.total !== undefined ? parseNum(celulas[col.total] ?? "") : NaN
     out.push({
       numero,
-      ...(valores.length ? { total: Math.max(...valores) } : {}),
-      ...(cliente ? { cliente } : {}),
-      ...(data ? { data } : {}),
+      ...(col.tipo !== undefined && celulas[col.tipo] ? { tipo: celulas[col.tipo] } : {}),
+      ...(col.cliente !== undefined && celulas[col.cliente] ? { cliente: celulas[col.cliente] } : {}),
+      ...(isNaN(valor) ? {} : { total: valor }),
+      ...(col.data !== undefined && celulas[col.data] ? { data: celulas[col.data] } : {}),
+      ...(col.estado !== undefined && celulas[col.estado] ? { estado: celulas[col.estado] } : {}),
+      ...(col.pago !== undefined && celulas[col.pago] ? { pago: celulas[col.pago] } : {}),
     })
+  }
+
+  if (!col) {
+    throw new WeoError("PARSE", "nao encontrei o cabecalho da tabela de documentos")
   }
   return out
 }

@@ -147,20 +147,49 @@ describe("regressao: o bug que emitiria fatura de 1000 euros", () => {
 })
 
 describe("parseInvoiceListHtml", () => {
-  test("extrai numero e total das linhas", () => {
-    const html = `<table>
-      <tr><td>2026/11</td><td>28-08-2026</td><td>CLIENTE BALCAO</td><td>1,00</td></tr>
-      <tr><td>2026/10</td><td>28-08-2026</td><td>CLIENTE BALCAO</td><td>10,00</td></tr>
-    </table>`
+  // estrutura real: Tipo | Número | Cliente | Valor | Emissão | Vencimento | Estado | Pago
+  const CAB = `<tr><th>Tipo</th><th>Número</th><th>Cliente</th><th>Valor</th>
+    <th>Emissão</th><th>Vencimento</th><th>Estado</th><th>Pago</th></tr>`
+  const linha = (n: string, cli: string, val: string, dt: string) =>
+    `<tr><td>Factura Simplificada</td><td>${n}</td><td>${cli}</td><td>${val}</td>
+     <td>${dt}</td><td>${dt}</td><td>Fechado</td><td>Pago</td></tr>`
+
+  test("lê as colunas pela posição do cabeçalho", () => {
+    const html = `<table>${CAB}${linha("2026/17", "INDIFERENCIADO", "30,00 €", "2026-08-28")}</table>`
     const r = parseInvoiceListHtml(html)
-    expect(r).toHaveLength(2)
-    expect(r[0]!.numero).toBe("2026/11")
-    expect(r[0]!.total).toBe(1)
-    expect(r[1]!.total).toBe(10)
+    expect(r).toHaveLength(1)
+    expect(r[0]!.numero).toBe("2026/17")
+    expect(r[0]!.total).toBe(30)
+    expect(r[0]!.data).toBe("2026-08-28")
+    expect(r[0]!.estado).toBe("Fechado")
   })
-  test("ignora linhas de cabecalho", () => {
-    const html = `<table><tr><th>Numero</th><th>Total</th></tr>
-      <tr><td>2026/11</td><td>1,00</td></tr></table>`
+
+  test("o cliente é o cliente, não o tipo de documento", () => {
+    // regressão: a heurística antiga apanhava "Factura Simplificada" como cliente
+    const html = `<table>${CAB}${linha("2026/17", "INDIFERENCIADO", "30,00 €", "2026-08-28")}</table>`
+    const f = parseInvoiceListHtml(html)[0]!
+    expect(f.cliente).toBe("INDIFERENCIADO")
+    expect(f.tipo).toBe("Factura Simplificada")
+  })
+
+  test("ignora a linha de cabeçalho e a barra de filtros", () => {
+    const filtros = `<tr><td>Adicionar</td><td>- Filtrar por Cliente - INDIFERENCIADO</td></tr>`
+    const html = `<table>${filtros}${CAB}${linha("2026/17", "INDIFERENCIADO", "30,00 €", "2026-08-28")}</table>`
     expect(parseInvoiceListHtml(html)).toHaveLength(1)
+  })
+
+  test("aborta se o cabeçalho não existir (página mudou)", () => {
+    const html = `<table><tr><td>2026/11</td><td>1,00</td></tr></table>`
+    expect(() => parseInvoiceListHtml(html)).toThrow(/cabecalho/)
+  })
+
+  test("preserva a ordem para o corte por data", () => {
+    const html = `<table>${CAB}
+      ${linha("2026/17", "A", "30,00 €", "2026-08-28")}
+      ${linha("2026/16", "B", "25,00 €", "2026-08-28")}
+      ${linha("2026/9", "C", "10,00 €", "2026-08-27")}</table>`
+    const r = parseInvoiceListHtml(html)
+    expect(r.map((f) => f.numero)).toEqual(["2026/17", "2026/16", "2026/9"])
+    expect(r.filter((f) => f.data === "2026-08-28")).toHaveLength(2)
   })
 })

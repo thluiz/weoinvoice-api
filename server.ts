@@ -406,6 +406,29 @@ async function executarVenda(req: SaleReq) {
   return resultado
 }
 
+/** Data de hoje no fuso da máquina. `toISOString()` daria a data UTC, que vira o dia errado à noite. */
+function hojeLocal(): string {
+  const d = new Date()
+  const dd = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${dd(d.getMonth() + 1)}-${dd(d.getDate())}`
+}
+
+/** Fecho do dia: documentos emitidos na data, com totais por tipo. */
+async function resumoDoDia(data: string) {
+  const faturas = await client.listInvoicesByDate(data)
+  const total = round2(faturas.reduce((s, f) => s + (f.total ?? 0), 0))
+
+  const porTipo: Record<string, { quantidade: number; total: number }> = {}
+  for (const f of faturas) {
+    const t = f.tipo ?? "(sem tipo)"
+    porTipo[t] ??= { quantidade: 0, total: 0 }
+    porTipo[t].quantidade++
+    porTipo[t].total = round2(porTipo[t].total + (f.total ?? 0))
+  }
+
+  return { data, quantidade: faturas.length, total, porTipo, faturas }
+}
+
 /** R1: apos falha ambigua, procura na listagem uma fatura com o total esperado. */
 async function reconciliar(total: number) {
   try {
@@ -475,6 +498,17 @@ const server = Bun.serve({
         return json({ sucesso: true, faturas: await client.listInvoices(n) })
       }
 
+      // Fecho do dia: tudo o que foi emitido numa data, com o resumo.
+      if (rota === "/faturas/dia" && req.method === "GET") {
+        const pedido = url.searchParams.get("data") ?? "hoje"
+        const data = pedido === "hoje" ? hojeLocal() : pedido
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+          throw new ApiError("REQUEST", `data inválida: "${pedido}". Use YYYY-MM-DD ou "hoje".`)
+        }
+        await client.ensureSession()
+        return json({ sucesso: true, ...(await resumoDoDia(data)) })
+      }
+
       // MCP sobre HTTP, mesmo padrao do gossip-gate. Reusa as funcoes da REST.
       if (rota === "/mcp" && req.method === "POST") {
         const msg = await req.json().catch(() => null)
@@ -495,6 +529,14 @@ const server = Bun.serve({
           ultimasFaturas: async (n) => {
             await client.ensureSession()
             return { faturas: await client.listInvoices(Math.min(n || 10, 50)) }
+          },
+          faturasDoDia: async (d) => {
+            const data = !d || d === "hoje" ? hojeLocal() : d
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+              throw new ApiError("REQUEST", `data inválida: "${d}". Use YYYY-MM-DD ou "hoje".`)
+            }
+            await client.ensureSession()
+            return resumoDoDia(data)
           },
         })
         return resposta === null ? new Response(null, { status: 202 }) : json(resposta)

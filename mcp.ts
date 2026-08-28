@@ -11,6 +11,7 @@ export interface McpHandlers {
   catalogo(): Promise<unknown>
   atualizarCatalogo(): Promise<unknown>
   ultimasFaturas(n: number): Promise<unknown>
+  faturasDoDia(data: string): Promise<unknown>
 }
 
 export const TOOLS = [
@@ -62,10 +63,22 @@ export const TOOLS = [
   },
   {
     name: "weoinvoice_ultimas_faturas",
-    description: "Lista os últimos documentos emitidos (número, total, data). Útil para conferir uma emissão.",
+    description: "Lista os últimos documentos emitidos (número, tipo, cliente, total, data). Útil para conferir uma emissão.",
     inputSchema: {
       type: "object",
       properties: { ultimas: { type: "integer", description: "Quantas listar, padrão 10" } },
+    },
+  },
+  {
+    name: "weoinvoice_faturas_do_dia",
+    description:
+      "Fecho do dia: todos os documentos emitidos numa data, com o total e a divisão por tipo. " +
+      "Use para responder 'quanto vendi hoje', 'quais notas saíram hoje' ou para conferir um dia anterior.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        data: { type: "string", description: 'Data em YYYY-MM-DD, ou "hoje" (padrão)' },
+      },
     },
   },
 ]
@@ -111,6 +124,9 @@ export async function tratarMcp(msg: any, h: McpHandlers): Promise<unknown | nul
           break
         case "weoinvoice_ultimas_faturas":
           saida = await h.ultimasFaturas(Number(args?.ultimas ?? 10))
+          break
+        case "weoinvoice_faturas_do_dia":
+          saida = await h.faturasDoDia(String(args?.data ?? "hoje"))
           break
         default:
           throw new Error(`tool desconhecida: ${nome}`)
