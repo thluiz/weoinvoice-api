@@ -1,7 +1,7 @@
 {
   "name": "weoinvoice-api",
   "version": "0.1.0",
-  "description": "API HTTP para lançar vendas POS no weoInvoice sem browser",
+  "description": "HTTP API for posting POS sales to weoInvoice without a browser",
   "type": "module",
   "license": "MIT",
   "repository": {

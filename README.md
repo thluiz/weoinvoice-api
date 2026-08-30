@@ -1,112 +1,125 @@
 # weoinvoice-api
 
-API HTTP para lançar vendas de balcão (POS) no [weoInvoice](https://www.weoinvoice.com) sem abrir o browser.
+HTTP API for posting counter (POS) sales to [weoInvoice](https://www.weoinvoice.com) without
+opening a browser.
 
-O weoInvoice não publica uma API. Este serviço fala com a interface web dela por HTTP puro
-— sem Playwright, sem Chromium — e expõe um endpoint JSON que emite o documento e devolve
-o número da fatura.
+weoInvoice publishes no API. This service talks to its web interface over plain HTTP —
+no Playwright, no Chromium — and exposes a JSON endpoint that issues the document and
+returns the invoice number.
 
-> ### ⚠️ Isto emite documento fiscal real
+> ### ⚠️ This issues real fiscal documents
 >
-> Não existe ambiente de testes no weoInvoice, e documento emitido **não se apaga** —
-> só se estorna com nota de crédito. Todo o desenho deste serviço parte daí: ele prefere
-> recusar uma venda a emitir uma errada. Use `dryRun` à vontade; leia a seção
-> [Segurança por construção](#segurança-por-construção) antes de desligar as travas.
+> There is no test environment in weoInvoice, and an issued document **cannot be deleted** —
+> it can only be reversed with a credit note. The whole design of this service starts there:
+> it would rather refuse a sale than issue a wrong one. Use `dryRun` freely; read
+> [Safe by construction](#safe-by-construction) before turning off the guards.
 
-## Como funciona
+> ### A note on language
+>
+> The code and this README are in English. The **wire format is in Portuguese** — field
+> names (`itens`, `artigoId`, `precoUnitario`), response keys (`sucesso`, `mensagem`) and
+> error codes (`CARRINHO_SUJO`, `TOTAL_DIVERGENTE`). So are the assistant skills under
+> `clients/`. That is not an oversight: see [Why the wire and the skills are in
+> Portuguese](#why-the-wire-and-the-skills-are-in-portuguese).
 
-Uma venda no POS do weoInvoice é uma sequência de chamadas que dependem de estado no
-servidor: o carrinho vive na sessão PHP, não no pedido. O serviço reproduz essa sequência
+## How it works
+
+A sale in the weoInvoice POS is a sequence of calls that depend on state held on the
+server: the cart lives in the PHP session, not in the request. The service reproduces that
+sequence
 
 ```
-login → limpa carrinho → adiciona artigo → ajusta preço → confere total → finaliza
+login → empty cart → add article → adjust price → check total → finalize
 ```
 
-e envolve cada passo nas proteções abaixo.
+and wraps every step in the protections below.
 
-## Segurança por construção
+## Safe by construction
 
-| Risco | Resposta do serviço |
+| Risk | What the service does |
 |---|---|
-| **Retry duplicando fatura.** Se o finalize der timeout, a fatura pode ter sido criada mesmo assim. | `idempotencyKey` obrigatória e um ledger append-only. A chave é gravada como `finalizing` **antes** do finalize; se o processo morrer no meio, ela trava e o retry é recusado em vez de emitir de novo. Em falha de rede, o serviço procura a fatura na listagem antes de reportar erro. |
-| **Item órfão.** Uma venda que falhou no meio deixa item no carrinho, que entraria silenciosamente na fatura seguinte. | O carrinho é lido e esvaziado antes de cada venda, conferido item a item depois de montado, e desmontado por rollback em qualquer erro. |
-| **Valor errado no documento.** | O subtotal que o site calcula é comparado com o esperado, linha a linha e no total. Divergência aborta antes de emitir. |
-| **Duas vendas ao mesmo tempo** misturariam itens no mesmo carrinho. | Fila interna: uma venda por vez, do início ao fim. |
-| **Separador decimal.** | Negociado em runtime: manda um formato, confere o subtotal devolvido, tenta o outro se não bater, aborta se nenhum bater. Não é paranoia — ver o aviso abaixo. |
-| **A interface mudar sem aviso.** É uma API não documentada. | Os parsers falham alto em vez de chutar, e a falha vira notificação. |
+| **A retry duplicating an invoice.** If the finalize times out, the invoice may have been created anyway. | `idempotencyKey` is required, backed by an append-only ledger. The key is written as `finalizing` **before** the finalize; if the process dies midway, the key stays locked and the retry is refused instead of issuing again. On a network failure the service looks for the invoice in the listing before reporting an error. |
+| **An orphan item.** A sale that failed midway leaves an item in the cart, which would silently join the next invoice. | The cart is read and emptied before every sale, checked item by item once assembled, and torn down by rollback on any error. |
+| **A wrong amount on the document.** | The subtotal the site computes is compared against the expected one, line by line and in total. A mismatch aborts before issuing. |
+| **Two sales at once** would mix items in the same cart. | Internal queue: one sale at a time, start to finish. |
+| **The decimal separator.** | Negotiated at runtime: send one format, check the subtotal that comes back, try the other if it does not match, abort if neither does. This is not paranoia — see the warning below. |
+| **The interface changing without notice.** It is an undocumented API. | The parsers fail loudly instead of guessing, and the failure turns into a notification. |
 
-### ⚠️ O separador decimal não é detalhe
+### ⚠️ The decimal separator is not a detail
 
-Enviar `price=10.00` faz o site interpretar **1000**: ele lê o ponto como separador de
-milhar. Uma venda de dez euros emitiria uma fatura de mil. O formato correto é vírgula
-(`10,00`), mas o serviço não confia nisso — ele envia, lê o subtotal que o site devolve, e
-só prossegue se bater com o esperado. É a mesma verificação que apanha item órfão e preço
-ignorado, e está coberta por teste de regressão.
+Sending `price=10.00` makes the site read **1000**: it takes the dot as a thousands
+separator. A ten-euro sale would issue a thousand-euro invoice. The correct format is a
+comma (`10,00`), but the service does not trust that — it sends, reads the subtotal the
+site returns, and only carries on if it matches what was expected. It is the same check
+that catches an orphan item and an ignored price, and it is covered by a regression test.
 
-### A trava `WEO_CART_READ_VERIFIED`
+### The `WEO_CART_READ_VERIFIED` guard
 
-Ler o carrinho é o que impede um item órfão de entrar na fatura, e o HTML pode variar
-entre contas. Enquanto `WEO_CART_READ_VERIFIED=1` não estiver no `.env`, `dryRun` funciona
-mas a emissão real é recusada com `HTTP 503`.
+Reading the cart is what keeps an orphan item out of the invoice, and the HTML can vary
+between accounts. While `WEO_CART_READ_VERIFIED=1` is not in `.env`, `dryRun` works but
+real issuing is refused with `HTTP 503`.
 
-Antes de destravar, confirme os parsers contra a sua conta:
+Before unlocking it, confirm the parsers against your own account:
 
 ```bash
-bun run probe.ts --dump   # read-only: não adiciona nem emite nada
+bun run probe.ts --dump   # read-only: adds nothing, issues nothing
 ```
 
-Confira que os artigos aparecem, que a série sai correta, e que o carrinho é lido com um
-item presente (adicione um pela interface web e volte a correr). Só então mude a flag.
+Check that the articles show up, that the series comes out right, and that the cart is
+read with an item in it (add one through the web interface and run it again). Only then
+flip the flag.
 
-## Instalação
+## Install
 
-Requer [Bun](https://bun.sh).
+Requires [Bun](https://bun.sh).
 
 ```bash
 git clone https://github.com/thluiz/weoinvoice-api.git
 cd weoinvoice-api
-cp .env.example .env && chmod 600 .env   # preencher credenciais
+cp .env.example .env && chmod 600 .env   # fill in the credentials
 bun run server.ts
 ```
 
-Descubra os ids de artigo e cliente da sua conta em `GET /catalogo` — eles não estão no
-código, ficam todos no `.env` ou no pedido.
+Find your account's article and client ids in `GET /catalogo` — they are not in the code,
+they live in `.env` or in the request.
 
-### Como serviço
+### As a service
 
-`weoinvoice-api.service` é um unit systemd de exemplo. Ajuste os caminhos, e sirva atrás
-de um proxy — o serviço escuta apenas em `127.0.0.1`. Exemplo de rota nginx em
+`weoinvoice-api.service` is an example systemd unit. Adjust the paths, and serve it behind
+a proxy — the service listens on `127.0.0.1` only. There is an example nginx route in
 `weoinvoice.conf`.
 
 ## Endpoints
 
-Todos exigem o header `X-Api-Key`, exceto `/health`.
+All of them require the `X-Api-Key` header, except `/health`.
 
 ### `GET /health`
-Estado do serviço, se há sessão em cache e se a emissão real está habilitada. Não faz login.
+Service state, whether there is a cached session and whether real issuing is enabled.
+Does not log in.
 
 ### `GET /catalogo`
-Artigos POS e clientes da conta, lidos de `catalogo.json`. É o que resolve
-`"artigo": "NOME"` → id. Não faz login, portanto não derruba a sessão do browser.
+The account's POS articles and clients, read from `catalogo.json`. This is what resolves
+`"artigo": "NAME"` → id. Does not log in, so it does not drop the browser session.
 
 ### `POST /catalogo/refresh`
-Vai ao weoInvoice, reescreve `catalogo.json` e devolve o que mudou:
+Goes to weoInvoice, rewrites `catalogo.json` and returns what changed:
 
 ```json
 { "sucesso": true, "mudancas": { "artigosNovos": ["..."], "artigosRemovidos": [],
   "clientesNovos": 2, "clientesRemovidos": 0 } }
 ```
 
-O catálogo fica em ficheiro em vez de ser buscado a cada pedido porque muda muito
-raramente e cada busca custa um login. Chame isto quando criar artigo ou cliente novo.
-Se o weoInvoice devolver zero artigos, o ficheiro **não** é sobrescrito.
+The catalogue lives in a file instead of being fetched on every request because it changes
+very rarely and each fetch costs a login. Call this when you create a new article or
+client. If weoInvoice returns zero articles, the file is **not** overwritten.
 
 ### `GET /faturas?ultimas=N`
-Últimos N documentos da listagem, com tipo, cliente, valor, data, estado e se está pago.
+The last N documents from the listing, with type, client, amount, date, status and whether
+it is paid.
 
 ### `GET /faturas/dia?data=YYYY-MM-DD`
-Fecho do dia: tudo o que foi emitido nessa data, com o total e a divisão por tipo.
-`data` aceita `hoje` (padrão), resolvido no fuso da máquina.
+Day close: everything issued on that date, with the total and the breakdown by type.
+`data` also accepts `hoje` (the default), resolved in the machine's timezone.
 
 ```json
 { "sucesso": true, "data": "2026-08-28", "quantidade": 10, "total": 181,
@@ -114,11 +127,11 @@ Fecho do dia: tudo o que foi emitido nessa data, com o total e a divisão por ti
   "faturas": [ { "numero": "2026/17", "cliente": "...", "total": 30 } ] }
 ```
 
-A listagem do weoInvoice não filtra por data (só por cliente, tipo e palavra-chave), mas
-vem ordenada da mais recente para a mais antiga. O serviço percorre as páginas e para
-assim que aparece uma data anterior à procurada, o que normalmente resolve na primeira.
-Se uma página não trouxer documento novo, para também: o paginador do site não é de
-confiar e um ciclo aqui seria silencioso.
+The weoInvoice listing does not filter by date (only by client, type and keyword), but it
+comes ordered from most recent to oldest. The service walks the pages and stops as soon as
+a date earlier than the one wanted shows up, which usually settles it on the first page.
+If a page brings no new document, it stops too: the site's paginator is not to be trusted
+and a loop here would be silent.
 
 ### `POST /pos/sale`
 
@@ -128,91 +141,141 @@ confiar e um ciclo aqui seria silencioso.
     { "artigoId": "12345", "precoUnitario": 15.00, "quantidade": 1, "descontoPct": 0 }
   ],
   "clienteId": "67890",             // default: WEO_CLIENTE_PADRAO
-  "tipoDocumento": "simplificada",  // default; ou "factura"
-  "serie": "2026",                  // default: lida do combobox do POS
+  "tipoDocumento": "simplificada",  // default; or "factura"
+  "serie": "2026",                  // default: read from the POS combobox
   "dryRun": false,
-  "idempotencyKey": "uuid-..."      // obrigatória quando dryRun=false
+  "idempotencyKey": "uuid-..."      // required when dryRun=false
 }
 ```
 
-Em vez de `artigoId` dá para mandar `artigo` com o nome. O match é exato e
-case-insensitive; nome ambíguo vira erro listando os candidatos, nunca uma escolha
-silenciosa.
+Instead of `artigoId` you can send `artigo` with the name. The match is exact and
+case-insensitive; an ambiguous name becomes an error listing the candidates, never a
+silent pick.
 
-**Sucesso**
+**Success**
 
 ```json
 { "sucesso": true, "numero": "2026/12", "idInterno": "...", "total": 15.00, "pdfUrl": "..." }
 ```
 
-**Dry-run** devolve a mesma forma sem `numero`/`idInterno`, mais `formatoDecimal` e
-`carrinhoLimpoDepois`. Nada é emitido e o carrinho fica vazio.
+**Dry-run** returns the same shape without `numero`/`idInterno`, plus `formatoDecimal` and
+`carrinhoLimpoDepois`. Nothing is issued and the cart is left empty.
 
-**Erro**: `{ "sucesso": false, "erro": "<CODIGO>", "mensagem": "..." }`
+**Error**: `{ "sucesso": false, "erro": "<CODE>", "mensagem": "..." }`
 
-| Código | HTTP | Significado |
+| Code | HTTP | Meaning |
 |---|---|---|
-| `REQUEST` | 400 | payload inválido |
-| `NAO_AUTORIZADO` | 401 | `X-Api-Key` ausente ou errada |
-| `ARTIGO_DESCONHECIDO` | 404 | nome não encontrado ou ambíguo no catálogo |
-| `CARRINHO_SUJO` | 409 | havia item anterior e não foi possível removê-lo |
-| `TOTAL_DIVERGENTE` | 409 | o total do site não bate com o pedido |
-| `FINALIZE_REJEITADO` | 422 | o weoInvoice recusou — nada foi criado |
-| `CARRINHO_NAO_VERIFICADO` | 503 | trava de segurança ativa |
-| `SESSAO` / `PARSE` | 502 | falha de autenticação ou resposta em formato inesperado |
-| `AMBIGUO_VERIFICAR_LISTAGEM` | 409/502 | **conferir manualmente**: pode haver documento emitido |
+| `REQUEST` | 400 | invalid payload |
+| `NAO_AUTORIZADO` | 401 | `X-Api-Key` missing or wrong |
+| `ARTIGO_DESCONHECIDO` | 404 | name not found in the catalogue, or ambiguous |
+| `CARRINHO_SUJO` | 409 | there was a leftover item and it could not be removed |
+| `TOTAL_DIVERGENTE` | 409 | the site's total does not match the request |
+| `FINALIZE_REJEITADO` | 422 | weoInvoice refused — nothing was created |
+| `CARRINHO_NAO_VERIFICADO` | 503 | the safety guard is active |
+| `SESSAO` / `PARSE` | 502 | authentication failure, or a response in an unexpected format |
+| `AMBIGUO_VERIFICAR_LISTAGEM` | 409/502 | **check manually**: a document may have been issued |
 
-`AMBIGUO_VERIFICAR_LISTAGEM` é o único erro que exige ação humana. Significa que o
-serviço não conseguiu determinar se a fatura foi criada. Confira `GET /faturas` antes de
-tentar de novo, e use uma `idempotencyKey` nova se for reemitir.
+`AMBIGUO_VERIFICAR_LISTAGEM` is the only error that demands a human. It means the service
+could not determine whether the invoice was created. Check `GET /faturas` before trying
+again, and use a fresh `idempotencyKey` if you do re-issue.
 
-## Desenvolvimento
+## MCP
+
+`POST /mcp` exposes the same operations as MCP tools over HTTP, so an assistant can call
+them directly: `weoinvoice_lancar_nota`, `weoinvoice_catalogo`,
+`weoinvoice_atualizar_catalogo`, `weoinvoice_ultimas_faturas` and
+`weoinvoice_faturas_do_dia`. Each call generates its own `idempotencyKey`, so a retry at
+the transport layer does not issue twice.
+
+## Clients
+
+`clients/openclaw/` holds the pieces that let the shop owner post sales from Telegram: two
+OpenClaw skills and the script they drive.
+
+| | |
+|---|---|
+| `SKILL-registrar-venda.md` | Turns a message like *"15 euros de cerâmicas"* into one or more sales. Always preview → confirm → issue. |
+| `SKILL-listar-notas-dia.md` | Day close: what was issued on a date, the total and the breakdown by type. Read-only. |
+| `pos-venda.py` | `--preview` / `--emitir` with the sales JSON, `--catalogo`, `--dia [date]`. |
+
+They are two separate skills on purpose: querying what has already been issued is a pure
+read, issuing a new document is irreversible. Keeping them together forced every query to
+carry the whole warning about confirmation and issuing.
+
+The script resolves the date itself (`hoje`, `ontem`, `anteontem`, `DD/MM`, `DD/MM/AAAA`,
+`AAAA-MM-DD`, or a number of days back) instead of letting the model convert "yesterday"
+into a date it may get wrong. A wrong date in a day close raises no error: it gives a
+wrong number that looks right. An impossible date (`31/02`) or ambiguous text
+(`"semana passada"`) is refused with a message rather than resolved by approximation.
+
+### Why the wire and the skills are in Portuguese
+
+1. **The operator writes in Portuguese.** The skills are read by a model that has to
+   understand messages like *"15, 30 e 50 de canecas"* and answer in the same language,
+   on Telegram, mid-sale. Their examples, their disambiguation rules and their refusal
+   messages have to be in the language actually being typed. Translating them would mean
+   the model matching Portuguese input against English examples.
+2. **The catalogue is in Portuguese.** Article and client names come from the weoInvoice
+   account as they are (`CERÂMICA`, `CANECA`), and article matching happens by name.
+3. **The wire mirrors weoInvoice.** The document types (`Factura`, `Factura
+   Simplificada`), the listing header (`Tipo`, `Número`, `Cliente`, `Valor`, `Emissão`,
+   `Vencimento`, `Estado`, `Pago`) and the amount format are the site's own. Field names
+   and error codes stay in the same language as the thing they describe, so there is no
+   mapping layer to get wrong between the parser and the endpoint.
+
+Code, comments, commit history and documentation are in English. Whatever touches
+weoInvoice or the person using it stays in Portuguese.
+
+## Development
 
 ```bash
-bun test          # parsers e aritmética monetária, sem rede nem credencial
+bun test          # parsers and money arithmetic, no network and no credentials
 ```
 
-Os parsers de HTML ficam isolados no fim de `weo.ts` de propósito: são a parte frágil,
-a que quebra se o weoInvoice mudar a interface, e a que os testes cobrem melhor.
+The HTML parsers sit isolated at the end of `weo.ts` on purpose: they are the fragile part,
+the one that breaks if weoInvoice changes its interface, and the one the tests cover best.
 
-## O protocolo
+## The protocol
 
-Levantado por inspeção da interface. A sessão é mantida por cookie, e as chamadas levam um
-`js_enabled=1`. Todas as chamadas são `POST` em `admin.php` com respostas de texto
-separado por `|`, não JSON.
+Reverse-engineered by inspecting the interface. Every call is a `POST` to `admin.php`,
+authenticated by the session cookie, with responses in text separated by `|`, not JSON.
 
-| Ação | `func=` | Corpo | Resposta |
+| Action | `func=` | Body | Response |
 |---|---|---|---|
-| Login | `submitlogin` (`module=user`) | `email`, `password`, `submit` | `302` para a listagem |
-| Adicionar artigo | `ajax_addposinvoiceproduct` | `id` | `itemId\|\|nome\|\|preço\|\|taxa` |
-| Ajustar item | `ajax_updateposinvoiceproduct` | `id`, `quantity`, `price`, `discount` | `qtd\|preço\|subtotal\|taxa\|desconto` |
-| Remover item | `ajax_removeposinvoiceproduct` | `id` | — |
-| Finalizar | `ajax_addposinvoice` | `pos_client`, `pos_type_*`, `pos_serie` | `200\|<id>` |
+| Login | `submitlogin` (`module=user`) | `email`, `password`, `submit` | `302` to the listing |
+| Add article | `ajax_addposinvoiceproduct` | `id` | `itemId\|\|name\|\|price\|\|tax` |
+| Adjust item | `ajax_updateposinvoiceproduct` | `id`, `quantity`, `price`, `discount` | `qty\|price\|subtotal\|tax\|discount` |
+| Remove item | `ajax_removeposinvoiceproduct` | `id` | — |
+| Finalize | `ajax_addposinvoice` | `pos_client`, `pos_type_*`, `pos_serie` | `200\|<id>` |
 
-O número visível da fatura (`2026/12`) não vem do finalize — só aparece na listagem, de
-onde o serviço o lê depois de emitir.
+The visible invoice number (`2026/12`) does not come from the finalize — it only shows up
+in the listing, where the service reads it after issuing.
 
-Os tipos de documento habilitados variam por conta: `Factura` e `Factura Simplificada`
-são os que este serviço cobre.
+Which document types are enabled varies per account: `Factura` and `Factura Simplificada`
+(the site's own labels) are the ones this service covers.
 
-Outras coisas que só se descobrem por inspeção:
+Other things you only find out by inspection:
 
-- **O carrinho pertence ao utilizador, não à sessão.** Sobrevive a reload e a novo login.
-  Um item deixado para trás fica lá à espera da próxima fatura, e a interface web não o
-  mostra ao recarregar — ela reconstrói o carrinho só a partir do que você clica.
-  Por isso o serviço lê e esvazia o carrinho antes de cada venda.
-- **A página POS reflete o carrinho do servidor** em `num_products`, nos ids `itemNNN` e
-  no rodapé de total. Esse total é calculado pelo servidor e é o valor que vai para o
-  documento, por isso é ele que o serviço confere antes de finalizar.
-- **A série não vem de um endpoint.** O `<select id="pos_serie">` chega vazio e o
-  `ajax_getseries` está comentado no `pos.js`; as opções vêm de um bloco escondido
-  `#pos-serie-standard`.
-- **Encoding misto.** As páginas HTML vêm em windows-1252 sem declarar charset, as
-  respostas AJAX em UTF-8. O serviço decide pelo conteúdo, senão nomes acentuados chegam
-  partidos e o match por nome falha.
+- **The cart belongs to the user, not to the session.** It survives a reload and a new
+  login. An item left behind sits there waiting for the next invoice, and the web
+  interface does not show it on reload — it rebuilds the cart only from what you click.
+  That is why the service reads and empties the cart before every sale.
+- **The POS page reflects the server-side cart** in `num_products`, in the `itemNNN` ids
+  and in the footer total. That total is computed by the server and is the value that goes
+  into the document, which is why it is the one the service checks before finalizing.
+- **The series does not come from an endpoint.** The `<select id="pos_serie">` arrives
+  empty and `ajax_getseries` is commented out in `pos.js`; the options come from a hidden
+  `#pos-serie-standard` block.
+- **Mixed encoding.** The HTML pages come in windows-1252 without declaring a charset, the
+  AJAX responses in UTF-8. The service decides by content, otherwise accented names arrive
+  broken and matching by name fails.
 
-## Aviso
+## Disclaimer
 
-Projeto independente, sem relação com a weoInvoice. Depende de detalhes internos da
-interface web dela e pode parar de funcionar sem aviso a qualquer atualização do site.
-Você é responsável pelos documentos fiscais que emitir com isto.
+Independent project, unaffiliated with weoInvoice. It depends on internal details of their
+web interface and may stop working without notice on any update to the site. You are
+responsible for the fiscal documents you issue with it.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
